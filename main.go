@@ -1,154 +1,141 @@
-// Command go-match3 is an interactive terminal match-3 game.
+//go:build windows
+
+// Command go-match3 is a match-3 game rendered without any game engine:
+// a raw Win32 window, a hand-rolled message pump, GDI double buffering,
+// and a fixed-step timer driving the animation state machine in app.go.
 //
-// Swap two adjacent gems to line up 3 or more of the same kind.
-// Cleared gems score points, gems above fall down, and chain
-// reactions multiply your score.
+// The terminal version lives in cmd/cli.
 package main
 
 import (
-	"bufio"
-	"fmt"
 	"math/rand"
-	"os"
-	"strings"
+	"runtime"
+	"syscall"
 	"time"
-
-	"github.com/fishingboy/go-match3/game"
+	"unsafe"
 )
 
-const (
-	boardRows  = 8
-	boardCols  = 8
-	totalMoves = 20
+var (
+	app      *App
+	lastTick time.Time
 )
-
-var gemFaces = map[game.Gem]string{
-	game.Empty:    "  ",
-	game.Ruby:     "\x1b[31m●\x1b[0m ",
-	game.Emerald:  "\x1b[32m■\x1b[0m ",
-	game.Sapphire: "\x1b[34m◆\x1b[0m ",
-	game.Topaz:    "\x1b[33m▲\x1b[0m ",
-	game.Amethyst: "\x1b[35m★\x1b[0m ",
-	game.Pearl:    "\x1b[36m♥\x1b[0m ",
-}
 
 func main() {
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	board := game.NewBoard(boardRows, boardCols, rng)
-	score := 0
-	movesLeft := totalMoves
+	// Win32 windows are bound to the thread that created them; the
+	// message loop must stay on that same OS thread.
+	runtime.LockOSThread()
 
-	fmt.Println("=== Go Match-3 ===")
-	fmt.Println("指令: 交換兩個相鄰寶石，例如 `a1 a2`；`hint` 提示；`q` 離開")
+	app = newApp(rand.New(rand.NewSource(time.Now().UnixNano())))
+	lastTick = time.Now()
 
-	scanner := bufio.NewScanner(os.Stdin)
-	for movesLeft > 0 {
-		ensurePlayable(board)
-		render(board, score, movesLeft)
+	hInst, _, _ := pGetModuleHandleW.Call(0)
+	className, _ := syscall.UTF16PtrFromString("GoMatch3Window")
+	title, _ := syscall.UTF16PtrFromString("Go Match-3 (no engine, raw Win32/GDI)")
+	cursor, _, _ := pLoadCursorW.Call(0, idcArrow)
 
-		fmt.Print("> ")
-		if !scanner.Scan() {
-			break
+	wc := wndClassEx{
+		cbSize:        uint32(unsafe.Sizeof(wndClassEx{})),
+		style:         csHRedraw | csVRedraw,
+		lpfnWndProc:   syscall.NewCallback(wndProc),
+		hInstance:     hInst,
+		hCursor:       cursor,
+		lpszClassName: className,
+	}
+	if r, _, err := pRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc))); r == 0 {
+		panic("RegisterClassExW failed: " + err.Error())
+	}
+
+	// Fixed-size window: grow the outer rect so the *client* area is
+	// exactly the board plus HUD.
+	style := uintptr(wsCaption | wsSysMenu | wsMinimizeBox)
+	rc := rect{0, 0, winW, winH}
+	pAdjustWindowRect.Call(uintptr(unsafe.Pointer(&rc)), style, 0)
+
+	hwnd, _, err := pCreateWindowExW.Call(0,
+		uintptr(unsafe.Pointer(className)),
+		uintptr(unsafe.Pointer(title)),
+		style|wsVisible,
+		cwUseDefault, cwUseDefault,
+		uintptr(rc.right-rc.left), uintptr(rc.bottom-rc.top),
+		0, 0, hInst, 0)
+	if hwnd == 0 {
+		panic("CreateWindowExW failed: " + err.Error())
+	}
+
+	// ~60 FPS tick; WM_TIMER drives update() + InvalidateRect.
+	pSetTimer.Call(hwnd, 1, 16, 0)
+
+	var m msgW
+	for {
+		r, _, _ := pGetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
+		if int32(r) <= 0 {
+			return
 		}
-		line := strings.TrimSpace(strings.ToLower(scanner.Text()))
-		switch {
-		case line == "q" || line == "quit" || line == "exit":
-			movesLeft = 0
-		case line == "hint" || line == "h":
-			if a, c, ok := board.FindHint(); ok {
-				fmt.Printf("提示: %s %s\n", posToCoord(a), posToCoord(c))
-			}
-		case line == "":
-			// ignore empty input
-		default:
-			a, c, err := parseMove(line)
-			if err != nil {
-				fmt.Println("看不懂的指令，格式範例: a1 a2")
-				continue
-			}
-			gained, cascades, err := board.Swap(a, c)
-			switch err {
-			case nil:
-				score += gained
-				movesLeft--
-				if cascades > 1 {
-					fmt.Printf("連鎖 x%d！+%d 分\n", cascades, gained)
-				} else {
-					fmt.Printf("+%d 分\n", gained)
-				}
-			case game.ErrNoMatch:
-				fmt.Println("這一步不會消除任何寶石，換一步吧")
-			case game.ErrNotAdjacent:
-				fmt.Println("只能交換上下左右相鄰的寶石")
-			default:
-				fmt.Println("無效的位置")
-			}
+		pTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
+		pDispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
+	}
+}
+
+func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
+	switch msg {
+	case wmTimer:
+		now := time.Now()
+		dt := now.Sub(lastTick).Seconds()
+		lastTick = now
+		if dt > 0.1 {
+			dt = 0.1 // clamp after stalls (drag, sleep) so animations don't jump
 		}
-	}
+		app.update(dt)
+		pInvalidateRect.Call(hwnd, 0, 0)
 
-	fmt.Printf("\n遊戲結束！總分: %d\n", score)
-}
+	case wmPaint:
+		onPaint(hwnd)
 
-// ensurePlayable reshuffles the board when no valid move remains.
-func ensurePlayable(b *game.Board) {
-	if _, _, ok := b.FindHint(); !ok {
-		fmt.Println("沒有可消除的步了，重新洗牌...")
-		b.Shuffle()
-	}
-}
+	case wmEraseBkgnd:
+		return 1 // we repaint every pixel; skipping the erase avoids flicker
 
-func render(b *game.Board, score, movesLeft int) {
-	fmt.Printf("\n分數: %d   剩餘步數: %d\n\n   ", score, movesLeft)
-	for c := 0; c < b.Cols; c++ {
-		fmt.Printf("%c ", 'a'+c)
-	}
-	fmt.Println()
-	for r := 0; r < b.Rows; r++ {
-		fmt.Printf("%2d ", r+1)
-		for c := 0; c < b.Cols; c++ {
-			fmt.Print(gemFaces[b.At(r, c)])
+	case wmLButtonDown:
+		x := int(int16(lParam & 0xFFFF))
+		y := int(int16((lParam >> 16) & 0xFFFF))
+		app.click(x, y)
+
+	case wmKeyDown:
+		switch wParam {
+		case vkEscape:
+			pPostQuitMessage.Call(0)
+		case vkR:
+			app.reset()
 		}
-		fmt.Println()
+
+	case wmDestroy:
+		pPostQuitMessage.Call(0)
+
+	default:
+		r, _, _ := pDefWindowProcW.Call(hwnd, msg, wParam, lParam)
+		return r
 	}
-	fmt.Println()
+	return 0
 }
 
-// parseMove parses input like "a1 b1" into two board positions.
-func parseMove(line string) (game.Pos, game.Pos, error) {
-	fields := strings.Fields(line)
-	if len(fields) != 2 {
-		return game.Pos{}, game.Pos{}, fmt.Errorf("expected two coordinates")
-	}
-	a, err := parseCoord(fields[0])
-	if err != nil {
-		return game.Pos{}, game.Pos{}, err
-	}
-	c, err := parseCoord(fields[1])
-	if err != nil {
-		return game.Pos{}, game.Pos{}, err
-	}
-	return a, c, nil
-}
+// onPaint draws the frame into an off-screen bitmap and blits it in one
+// go — GDI double buffering by hand.
+func onPaint(hwnd uintptr) {
+	var ps paintStruct
+	hdc, _, _ := pBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 
-// parseCoord parses a coordinate like "a1" (column letter + 1-based row).
-func parseCoord(s string) (game.Pos, error) {
-	if len(s) < 2 || s[0] < 'a' || s[0] > 'z' {
-		return game.Pos{}, fmt.Errorf("bad coordinate %q", s)
-	}
-	col := int(s[0] - 'a')
-	row := 0
-	for _, ch := range s[1:] {
-		if ch < '0' || ch > '9' {
-			return game.Pos{}, fmt.Errorf("bad coordinate %q", s)
-		}
-		row = row*10 + int(ch-'0')
-	}
-	if row == 0 {
-		return game.Pos{}, fmt.Errorf("bad coordinate %q", s)
-	}
-	return game.Pos{Row: row - 1, Col: col}, nil
-}
+	var rc rect
+	pGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rc)))
+	w, h := int(rc.right), int(rc.bottom)
 
-func posToCoord(p game.Pos) string {
-	return fmt.Sprintf("%c%d", 'a'+p.Col, p.Row+1)
+	memDC, _, _ := pCreateCompatibleDC.Call(hdc)
+	bmp, _, _ := pCreateCompatibleBitmap.Call(hdc, uintptr(w), uintptr(h))
+	oldBmp, _, _ := pSelectObject.Call(memDC, bmp)
+
+	app.draw(memDC)
+	pBitBlt.Call(hdc, 0, 0, uintptr(w), uintptr(h), memDC, 0, 0, srcCopy)
+
+	pSelectObject.Call(memDC, oldBmp)
+	pDeleteObject.Call(bmp)
+	pDeleteDC.Call(memDC)
+	pEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 }

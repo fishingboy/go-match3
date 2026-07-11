@@ -96,23 +96,27 @@ func (b *Board) Swap(a, c Pos) (score, cascades int, err error) {
 	if !b.InBounds(a.Row, a.Col) || !b.InBounds(c.Row, c.Col) {
 		return 0, 0, ErrOutOfBounds
 	}
-	if !adjacent(a, c) {
+	if !Adjacent(a, c) {
 		return 0, 0, ErrNotAdjacent
 	}
-	b.swapCells(a, c)
+	b.SwapCells(a, c)
 	if len(b.FindMatches()) == 0 {
-		b.swapCells(a, c)
+		b.SwapCells(a, c)
 		return 0, 0, ErrNoMatch
 	}
 	score, cascades = b.Resolve()
 	return score, cascades, nil
 }
 
-func (b *Board) swapCells(a, c Pos) {
+// SwapCells exchanges two cells unconditionally, without validation or
+// match resolution. UIs that animate the swap themselves use this
+// together with FindMatches, Clear and CollapseAndRefill.
+func (b *Board) SwapCells(a, c Pos) {
 	b.cells[a.Row][a.Col], b.cells[c.Row][c.Col] = b.cells[c.Row][c.Col], b.cells[a.Row][a.Col]
 }
 
-func adjacent(a, c Pos) bool {
+// Adjacent reports whether two positions are orthogonal neighbors.
+func Adjacent(a, c Pos) bool {
 	dr, dc := a.Row-c.Row, a.Col-c.Col
 	if dr < 0 {
 		dr = -dr
@@ -178,39 +182,55 @@ func (b *Board) Resolve() (score, cascades int) {
 		}
 		cascades++
 		score += len(matches) * 10 * cascades
-		for _, p := range matches {
-			b.cells[p.Row][p.Col] = Empty
-		}
-		b.applyGravity()
-		b.refill()
+		b.Clear(matches)
+		b.CollapseAndRefill()
 	}
 }
 
-// applyGravity slides gems down into empty cells, column by column.
-func (b *Board) applyGravity() {
+// Clear empties the given cells (typically the result of FindMatches).
+func (b *Board) Clear(cells []Pos) {
+	for _, p := range cells {
+		b.cells[p.Row][p.Col] = Empty
+	}
+}
+
+// Fall describes one gem's vertical drop after matches are cleared:
+// the gem in column Col falls from FromRow to ToRow. Newly spawned gems
+// start above the board, so their FromRow is negative.
+type Fall struct {
+	Col, FromRow, ToRow int
+	Gem                 Gem
+}
+
+// CollapseAndRefill slides gems down into empty cells and spawns new gems
+// at the top, returning every movement so a UI can animate the drops.
+// Existing-gem falls are reported before spawns within each column.
+func (b *Board) CollapseAndRefill() []Fall {
+	var falls []Fall
 	for c := 0; c < b.Cols; c++ {
 		write := b.Rows - 1
 		for r := b.Rows - 1; r >= 0; r-- {
-			if b.cells[r][c] != Empty {
-				b.cells[write][c] = b.cells[r][c]
-				write--
-			}
-		}
-		for r := write; r >= 0; r-- {
-			b.cells[r][c] = Empty
-		}
-	}
-}
-
-// refill fills every empty cell with a random gem.
-func (b *Board) refill() {
-	for r := 0; r < b.Rows; r++ {
-		for c := 0; c < b.Cols; c++ {
 			if b.cells[r][c] == Empty {
-				b.cells[r][c] = Gem(b.rng.Intn(NumGemTypes) + 1)
+				continue
 			}
+			if write != r {
+				g := b.cells[r][c]
+				b.cells[write][c] = g
+				b.cells[r][c] = Empty
+				falls = append(falls, Fall{Col: c, FromRow: r, ToRow: write, Gem: g})
+			}
+			write--
+		}
+		// Rows 0..write are now empty; spawn replacements stacked above
+		// the board so they visually drop in from off-screen.
+		spawnCount := write + 1
+		for r := write; r >= 0; r-- {
+			g := Gem(b.rng.Intn(NumGemTypes) + 1)
+			b.cells[r][c] = g
+			falls = append(falls, Fall{Col: c, FromRow: r - spawnCount, ToRow: r, Gem: g})
 		}
 	}
+	return falls
 }
 
 // FindHint returns one valid move (a pair of cells whose swap creates a
@@ -225,9 +245,9 @@ func (b *Board) FindHint() (a, c Pos, ok bool) {
 					continue
 				}
 				p1, p2 := Pos{r, col}, Pos{nr, nc}
-				b.swapCells(p1, p2)
+				b.SwapCells(p1, p2)
 				found := len(b.FindMatches()) > 0
-				b.swapCells(p1, p2)
+				b.SwapCells(p1, p2)
 				if found {
 					return p1, p2, true
 				}

@@ -111,13 +111,14 @@ func TestSwapResolvesAndScores(t *testing.T) {
 	}
 }
 
-func TestGravityAndRefill(t *testing.T) {
+func TestCollapseAndRefill(t *testing.T) {
 	b := newTestBoard(t, [][]Gem{
 		{Topaz, Empty, Pearl},
 		{Empty, Empty, Empty},
 		{Empty, Sapphire, Ruby},
 	})
-	b.applyGravity()
+	falls := b.CollapseAndRefill()
+
 	if b.At(2, 0) != Topaz {
 		t.Errorf("Topaz should fall to bottom of column 0, got %v", b.At(2, 0))
 	}
@@ -125,16 +126,37 @@ func TestGravityAndRefill(t *testing.T) {
 		t.Errorf("Sapphire should stay at bottom of column 1, got %v", b.At(2, 1))
 	}
 	if b.At(1, 2) != Pearl || b.At(2, 2) != Ruby {
-		t.Errorf("column 2 should be [Empty, Pearl, Ruby], got [%v, %v, %v]",
+		t.Errorf("column 2 should end as [_, Pearl, Ruby], got [%v, %v, %v]",
 			b.At(0, 2), b.At(1, 2), b.At(2, 2))
 	}
-	b.refill()
 	for r := 0; r < b.Rows; r++ {
 		for c := 0; c < b.Cols; c++ {
 			if b.At(r, c) == Empty {
 				t.Fatalf("cell (%d,%d) still empty after refill", r, c)
 			}
 		}
+	}
+
+	// The Topaz drop must be reported for animation.
+	foundTopaz := false
+	spawns := 0
+	for _, f := range falls {
+		if f.Col == 0 && f.FromRow == 0 && f.ToRow == 2 && f.Gem == Topaz {
+			foundTopaz = true
+		}
+		if f.FromRow < 0 {
+			spawns++
+			if f.Gem != b.At(f.ToRow, f.Col) {
+				t.Errorf("spawn fall %+v does not match final board gem %v", f, b.At(f.ToRow, f.Col))
+			}
+		}
+	}
+	if !foundTopaz {
+		t.Errorf("missing fall for Topaz (0,0)->(2,0); falls: %+v", falls)
+	}
+	// 5 holes after the collapse: 2 in col 0, 2 in col 1, 1 in col 2.
+	if spawns != 5 {
+		t.Errorf("got %d spawned gems, want 5; falls: %+v", spawns, falls)
 	}
 }
 
